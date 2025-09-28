@@ -1019,3 +1019,210 @@ Respond with valid JSON only:
         )
         
         return self._store_table_with_schema(table_info)
+        def optimized_extract_and_store(self, pdf_path: str) -> Dict[str, Any]:
+    """
+    Table-aware, hybrid optimized PDF extraction:
+    - Structure-aware chunking (headings, paragraphs)
+    - Token-based adaptive chunk sizes
+    - Semantic grouping with overlap for context preservation
+    - Tables treated as atomic units
+    """
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+    from sklearn.metrics.pairwise import cosine_similarity
+    import re
+
+    text_chunks = []
+    stored_tables = []
+    current_table_info: Optional[TableInfo] = None
+    pdf_uuid = str(uuid.uuid4())[:8]
+
+    print(f"\n=== Optimized Table + Semantic Chunking PDF Processing ===")
+    print(f"File: {Path(pdf_path).name}, UUID: {pdf_uuid}")
+
+    # Semantic embedder
+    embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    similarity_threshold = 0.65  # Merge sentences if semantically similar
+    overlap_ratio = 0.2          # 20% overlap for chunks
+
+    # Helper functions
+    def is_heading(text: str) -> bool:
+        text = text.strip()
+        if not text:
+            return False
+        if len(text) > 3 and text.isupper():
+            return True
+        if re.match(r'^\d+(\.\d+)*\s+', text):
+            return True
+        return False
+
+    def chunk_sentences_by_token_limit(sentences, max_tokens=80, overlap_tokens=15):
+        chunks = []
+        current_chunk = []
+        current_tokens = 0
+        for sent in sentences:
+            tokens = sent.split()
+            n_tokens = len(tokens)
+            if current_tokens + n_tokens <= max_tokens:
+                current_chunk.append(sent)
+                current_tokens += n_tokens
+            else:
+                if current_chunk:
+                    chunks.append(" ".join(current_chunk))
+                # overlap for context
+                overlap = current_chunk[-overlap_tokens:] if overlap_tokens < len(current_chunk) else current_chunk
+                current_chunk = overlap + [sent]
+                current_tokens = sum(len(s.split()) for s in current_chunk)
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+        return chunks
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                text = page.extract_text() or ""
+                lines = [line.strip() for line in text.split("\n") if line.strip()]
+                
+                # Structure-aware paragraphs
+                paragraphs = []
+                buffer = ""
+                for line in lines:
+                    if is_heading(line):
+                        if buffer:
+                            paragraphs.append(buffer.strip())
+                        paragraphs.append(line)
+                        buffer = ""
+                    else:
+                        buffer += line + " "
+                if buffer:
+                    paragraphs.append(buffer.strip())
+
+                page_tables = page.extract_tables() or []
+                table_boundaries = []
+
+                # Preprocess tables
+                for table_idx, table in enumerate(page_tables):
+                    if not table or not table[0]:
+                        continue
+                    cleaned_table = [
+                        [str(cell) if cell is not None else "" for cell in row]
+                        for row in table if any(cell.strip() for cell in row if cell)
+                    ]
+                    if not cleaned_table:
+                        continue
+                    if len(cleaned_table) < len(cleaned_table[0]):
+                        cleaned_table = list(map(list, zip(*cleaned_table)))
+                    table_boundaries.append((table_idx, cleaned_table))
+
+                buffer = ""
+                for para in paragraphs:
+                    # adaptive max tokens
+                    para_tokens = len(para.split())
+                    max_tokens = 60 if para_tokens < 40 else 100
+                    overlap_tokens = int(max_tokens * overlap_ratio)
+
+                    # Check for table placeholder
+                    if "[TABLE]" in para:
+                        if buffer.strip():
+                            text_chunks.append(buffer.strip())
+                        buffer = ""
+                        table_idx = int(para.replace("[TABLE]", "").strip())
+                        table_data = table_boundaries[table_idx][1]
+
+                        # Table continuation logic
+                        if (current_table_info and len(table_data[0]) == current_table_info.column_count):
+                            if self._query_gemini_for_continuation(list(current_table_info.schema.keys()), table_data):
+                                current_table_info.data.extend(table_data)
+                                continue
+                        if current_table_info:
+                            self._store_table_with_schema(current_table_info)
+                            stored_tables.append({
+                                "name": current_table_info.name,
+                                "rows": len(current_table_info.data) - 1
+                            })
+
+                        context_dict = self._get_context_text(pdf_path, page_num, table_idx+1)
+                        global_table_index = len(stored_tables) + 1
+                        schema_info = self._query_gemini_for_schema(table_data, context_dict, pdf_uuid, global_table_index)
+                        self.schemas[schema_info.table_name] = {
+                            "schema": schema_info.table_schema,
+                            "description": schema_info.description,
+                            "pdf_uuid": pdf_uuid,
+                            "created_at": pd.Timestamp.now().isoformat(),
+                            "status": "processing"
+                        }
+                        self._save_schemas()
+                        current_table_info = TableInfo(
+                            name=schema_info.table_name,
+                            schema=schema_info.table_schema,
+                            description=schema_info.description,
+                            data=table_data,
+                            column_count=len(table_data[0])
+                        )
+                        current_table_info.context = context_dict
+                        continue
+
+                    # --- Sentence-level semantic chunking ---
+                    sentences = re.split(r'(?<=[.!?]) +', para)
+                    chunks = chunk_sentences_by_token_limit(sentences, max_tokens=max_tokens, overlap_tokens=overlap_tokens)
+
+                    # Merge semantically similar consecutive sentences
+                    for chunk in chunks:
+                        sent_list = re.split(r'(?<=[.!?]) +', chunk)
+                        sent_embeddings = embedder.encode(sent_list, convert_to_numpy=True)
+                        current_chunk = ""
+                        for i, sent in enumerate(sent_list):
+                            if not current_chunk:
+                                current_chunk = sent + " "
+                                continue
+                            sim_ok = cosine_similarity(
+                                sent_embeddings[i-1].reshape(1, -1),
+                                sent_embeddings[i].reshape(1, -1)
+                            )[0][0] >= similarity_threshold
+                            if sim_ok and len(current_chunk.split()) + len(sent.split()) <= max_tokens:
+                                current_chunk += sent + " "
+                            else:
+                                if current_chunk.strip():
+                                    text_chunks.append(current_chunk.strip())
+                                overlap_part = " ".join(current_chunk.split()[-overlap_tokens:])
+                                current_chunk = overlap_part + " " + sent + " "
+                        if current_chunk.strip():
+                            text_chunks.append(current_chunk.strip())
+
+                if buffer.strip():
+                    text_chunks.append(buffer.strip())
+
+            if current_table_info:
+                self._store_table_with_schema(current_table_info)
+                stored_tables.append({
+                    "name": current_table_info.name,
+                    "rows": len(current_table_info.data) - 1
+                })
+
+        # Semantic evaluation
+        if len(text_chunks) > 1:
+            embeddings = embedder.encode(text_chunks, convert_to_numpy=True)
+            similarities = [
+                cosine_similarity(embeddings[i-1].reshape(1, -1), embeddings[i].reshape(1, -1))[0][0]
+                for i in range(1, len(embeddings))
+            ]
+            avg_similarity = float(np.mean(similarities))
+        else:
+            avg_similarity = 0.0
+
+        print(f"\n--- Semantic Evaluation ---")
+        print(f"Total chunks: {len(text_chunks)}")
+        print(f"Average semantic similarity between consecutive chunks: {avg_similarity:.3f}")
+
+        return {
+            "text_chunks": text_chunks,
+            "tables_info": stored_tables,
+            "schemas_saved": len(stored_tables),
+            "pdf_name": Path(pdf_path).stem,
+            "pdf_uuid": pdf_uuid,
+            "avg_chunk_semantic_similarity": avg_similarity
+        }
+
+    except Exception as e:
+        print(f"Error in optimized extraction: {e}")
+        raise ValueError(f"Optimized extraction failed: {str(e)}")

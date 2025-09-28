@@ -114,8 +114,8 @@ async def process_pdf_upload(file: UploadFile) -> dict:
 
         try:
             # Enhanced content extraction and storage with Gemini
-            print("\n=== Starting Enhanced PDF Processing ===")
-            processing_result = pdf_processor.extract_and_store_content(temp_file_path)
+            print("\n=== Starting Optimized PDF Processing ===")
+            processing_result = pdf_processor.optimized_extract_and_store(temp_file_path)
 
             # Get the PDF name and UUID from processing result
             pdf_name = processing_result.get("pdf_name", filename)

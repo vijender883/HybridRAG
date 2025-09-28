@@ -5,9 +5,11 @@ import logging
 import os
 import re
 import uuid
+import math
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
+from collections import Counter
 
 import pdfplumber
 import pandas as pd
@@ -669,8 +671,13 @@ Respond with valid JSON only:
         
         return columns
 
-    def extract_and_store_content(self, pdf_path: str) -> Dict[str, Any]:
+
+#renamed the old extract and store content method to _legacy_extract_and_store_content
+    def _legacy_extract_and_store_content(self, pdf_path: str) -> Dict[str, Any]:
         """
+        DEPRECATED: Legacy PDF processing method.
+        Use optimized_extract_and_store() instead for better text chunking.
+        
         Enhanced content extraction with Gemini-powered schema inference.
         Combines extraction and storage into a single intelligent process.
         """
@@ -822,6 +829,337 @@ Respond with valid JSON only:
             logger.error(f"Enhanced PDF extraction failed: {str(e)}")
             print(f"Error: Enhanced PDF extraction failed: {str(e)}")
             raise ValueError(f"Enhanced PDF extraction error: {str(e)}")
+    
+    def optimized_extract_and_store(self, pdf_path: str) -> Dict[str, Any]:
+       
+        
+        import re
+        import uuid
+        from pathlib import Path
+        from collections import Counter
+        import math
+        import pandas as pd
+        import pdfplumber
+
+        # ----------------------------
+        # Tunables (adjust if needed)
+        # ----------------------------
+        TARGET_WORDS_MIN = 350         # ~750 tokens (rough approx 1 token ~ 1.3 words in English prose)
+        TARGET_WORDS_MAX = 650         # ~1200 tokens
+        HARD_MAX_WORDS   = 800         # emergency upper bound to avoid huge chunks
+        OVERLAP_SENTENCES = 2          # overlap for context preservation between chunks
+        SEM_SIM_THRESHOLD = 0.08       # semantic similarity threshold for grouping (0..1, cosine)
+        BULLET_PREFIX_RE  = r"^(\s*[-–•*]|(\s*\d+[\).\]]|\s*[A-Z]\))\s+)"
+        HEADING_RE = (
+            r"^(\s*"
+            r"([0-9]+\.){1,4}\s+[^\n]{2,}|"
+            r"[IVXLCM]+\.\s+[^\n]{2,}|"
+            r"[A-Z][A-Za-z0-9/&\-\s]{0,60}$|"
+            r"[A-Z0-9][A-Z0-9\s/&\-]{3,60}$"
+            r")"
+        )
+
+        STOPWORDS = {
+            "the","a","an","and","or","but","if","then","else","when","while","at","by","for",
+            "with","about","against","between","into","through","during","before","after",
+            "above","below","to","from","up","down","in","out","on","off","over","under",
+            "again","further","once","here","there","all","any","both","each","few","more",
+            "most","other","some","such","no","nor","not","only","own","same","so","than",
+            "too","very","can","will","just","don","should","now"
+        }
+
+        def sent_tokenize(text: str) -> list[str]:
+            # Conservative sentence splitter; keeps abbreviations fairly safe.
+            # Splits at . ! ? followed by space/newline and uppercase start or digit/quote.
+            parts = re.split(r'(?<=[.!?])\s+(?=[A-Z0-9"\'])', text.strip())
+            # Also split overly long parts by semicolons/newlines to avoid giant sentences
+            out = []
+            for p in parts:
+                if len(p) > 1200:
+                    out.extend(re.split(r'[;\n]{1,}', p))
+                else:
+                    out.append(p)
+            return [s.strip() for s in out if s.strip()]
+
+        def is_heading(line: str) -> bool:
+            s = line.strip()
+            if len(s) > 100:  # very long lines are unlikely to be headings
+                return False
+            return bool(re.match(HEADING_RE, s))
+
+        def is_bullet(line: str) -> bool:
+            return bool(re.match(BULLET_PREFIX_RE, line))
+
+        def normalize_words(text: str) -> list[str]:
+            words = re.findall(r"[A-Za-z0-9']+", text.lower())
+            return [w for w in words if w not in STOPWORDS]
+
+        def bow_vector(text: str) -> Counter:
+            return Counter(normalize_words(text))
+
+        def cosine_sim(c1: Counter, c2: Counter) -> float:
+            if not c1 or not c2:
+                return 0.0
+            # dot product
+            inter = set(c1.keys()) & set(c2.keys())
+            dot = sum(c1[k] * c2[k] for k in inter)
+            # magnitude
+            mag1 = math.sqrt(sum(v*v for v in c1.values()))
+            mag2 = math.sqrt(sum(v*v for v in c2.values()))
+            if mag1 == 0 or mag2 == 0:
+                return 0.0
+            return dot / (mag1 * mag2)
+
+        def sectionize(raw_text: str) -> list[dict]:
+            """
+            Split page text into sections by headings / blank lines / bullets,
+            but keep short 'header lines' attached to their following paragraph.
+            """
+            lines = [ln.rstrip() for ln in raw_text.splitlines()]
+            sections = []
+            buf = []
+            curr_heading = None
+
+            i = 0
+            while i < len(lines):
+                ln = lines[i]
+                if is_heading(ln):
+                    # flush previous section
+                    if buf:
+                        sections.append({"heading": curr_heading, "text": "\n".join(buf).strip()})
+                        buf = []
+                    curr_heading = ln.strip()
+                elif ln.strip() == "":
+                    # paragraph boundary
+                    if buf:
+                        sections.append({"heading": curr_heading, "text": "\n".join(buf).strip()})
+                        buf = []
+                else:
+                    # keep bullets tightly packed
+                    if is_bullet(ln):
+                        # ensure previous non-bullet paragraph is flushed
+                        if buf and not is_bullet(buf[-1]):
+                            sections.append({"heading": curr_heading, "text": "\n".join(buf).strip()})
+                            buf = []
+                    buf.append(ln)
+                i += 1
+
+            if buf:
+                sections.append({"heading": curr_heading, "text": "\n".join(buf).strip()})
+            # Filter empties
+            return [s for s in sections if s["text"]]
+
+        def build_chunks_from_sections(sections: list[dict], page_num: int) -> list[str]:
+            """
+            For each section: sentence tokenize, then semantically group sentences
+            until we reach target size. Add overlaps between consecutive chunks.
+            """
+            chunks: list[str] = []
+
+            for sec in sections:
+                heading = sec["heading"]
+                sentences = sent_tokenize(sec["text"])
+                if not sentences:
+                    continue
+
+                # Precompute sentence vectors (cheap)
+                sent_vecs = [bow_vector(s) for s in sentences]
+
+                curr: list[str] = []
+                curr_vec = Counter()
+                word_count = 0
+
+                def flush(with_overlap=True):
+                    nonlocal curr, curr_vec, word_count
+                    if not curr:
+                        return
+                    # Prefix with heading + (Page X) for light context anchoring
+                    prefix_bits = []
+                    if heading:
+                        prefix_bits.append(f"{heading.strip()}")
+                    prefix_bits.append(f"(Page {page_num})")
+                    prefix = " — ".join(prefix_bits)
+
+                    chunk_text = prefix + "\n" + " ".join(curr)
+                    chunks.append(chunk_text.strip())
+
+                    if with_overlap and OVERLAP_SENTENCES > 0:
+                        # keep last N sentences as seed for next chunk
+                        overlap = curr[-OVERLAP_SENTENCES:]
+                        curr = overlap[:]
+                        curr_vec = Counter()
+                        for s in curr:
+                            curr_vec.update(bow_vector(s))
+                        word_count = sum(len(normalize_words(s)) for s in curr)
+                    else:
+                        curr = []
+                        curr_vec = Counter()
+                        word_count = 0
+
+                for idx, (s, sv) in enumerate(zip(sentences, sent_vecs)):
+                    s_words = len(normalize_words(s))
+                    # If adding this sentence explodes past HARD_MAX_WORDS, flush first.
+                    if word_count + s_words > HARD_MAX_WORDS and curr:
+                        flush(with_overlap=True)
+
+                    # Similarity to current context
+                    sim = cosine_sim(curr_vec, sv) if curr else 1.0  # first sentence: force add
+
+                    # Heuristic: if current is already healthy size and similarity is low, start new chunk
+                    if curr and word_count >= TARGET_WORDS_MIN and sim < SEM_SIM_THRESHOLD:
+                        flush(with_overlap=True)
+
+                    # Add sentence
+                    curr.append(s)
+                    curr_vec.update(sv)
+                    word_count += s_words
+
+                    # Adaptive flush when exceeding soft max
+                    if word_count >= TARGET_WORDS_MAX:
+                        # If next sentence exists and is semantically different, flush now;
+                        # otherwise allow slight overflow to keep a coherent idea together.
+                        if idx + 1 < len(sentences):
+                            next_sim = cosine_sim(curr_vec, sent_vecs[idx + 1])
+                            if next_sim < SEM_SIM_THRESHOLD:
+                                flush(with_overlap=True)
+
+                # Flush remainder (without extra overlap to avoid duplication at section end)
+                flush(with_overlap=False)
+
+            return chunks
+
+        # ----------------------------------------------------------------------
+        # Main processing (mirrors your original, with improved text chunking)
+        # ----------------------------------------------------------------------
+        text_chunks: list[str] = []
+        stored_tables = []
+        current_table_info = None
+
+        pdf_uuid = str(uuid.uuid4())[:8]
+        logger.info(f"[Optimized] Starting PDF extraction for file: {pdf_path}")
+        print(f"\n=== Optimized PDF Processing ===")
+        print(f"File: {Path(pdf_path).name}")
+        print(f"File UUID: {pdf_uuid}")
+
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page_num, page in enumerate(pdf.pages, 1):
+                    # -------- Text (hybrid chunking) --------
+                    text = page.extract_text() or ""
+                    if text.strip():
+                        sections = sectionize(text)
+                        page_chunks = build_chunks_from_sections(sections, page_num)
+                        text_chunks.extend(page_chunks)
+
+                    # -------- Tables (same logic as your original) --------
+                    page_tables = page.extract_tables() or []
+                    logger.info(f"[Optimized] Found {len(page_tables)} tables on page {page_num}")
+
+                    for table_idx, table in enumerate(page_tables, 1):
+                        if not table or not table[0]:
+                            continue
+
+                        cleaned_table = [
+                            [str(cell) if cell is not None else "" for cell in row]
+                            for row in table if any((str(cell).strip() if cell is not None else "") for cell in row)
+                        ]
+                        if not cleaned_table:
+                            continue
+
+                        # transpose if looks sideways
+                        if len(cleaned_table) < len(cleaned_table[0]):
+                            cleaned_table = list(map(list, zip(*cleaned_table)))
+
+                        print(f"\nProcessing table {table_idx} on page {page_num}")
+                        print(f"Table dimensions: {len(cleaned_table)} rows x {len(cleaned_table[0])} columns")
+
+                        # Possible continuation of previous table
+                        if (current_table_info and len(cleaned_table[0]) == current_table_info.column_count):
+                            print("Checking if table continues previous one...")
+                            is_continuation = self._query_gemini_for_continuation(
+                                list(current_table_info.schema.keys()),
+                                cleaned_table
+                            )
+                            if is_continuation:
+                                print("✓ Continuing previous table")
+                                current_table_info.data.extend(cleaned_table)
+                                continue
+
+                        # Finalize previous table if exists
+                        if current_table_info:
+                            print(f"Finalizing table: {current_table_info.name}")
+                            success = self._store_table_with_schema(current_table_info)
+                            if success:
+                                updated_schema = self.schemas.get(current_table_info.name, {})
+                                stored_tables.append({
+                                    "name": current_table_info.name,
+                                    "rows": len(current_table_info.data) - 1,
+                                    "description": updated_schema.get('description', current_table_info.description)
+                                })
+
+                        # New table -> Gemini schema inference
+                        print("Analyzing new table with Gemini...")
+                        context_dict = self._get_context_text(pdf_path, page_num, table_idx)
+                        global_table_index = len(stored_tables) + 1
+                        schema_info = self._query_gemini_for_schema(cleaned_table, context_dict, pdf_uuid, global_table_index)
+
+                        print(f"✓ Gemini analysis complete:")
+                        print(f"  Table name: {schema_info.table_name}")
+                        print(f"  Schema: {schema_info.table_schema}")
+                        print(f"  Description: {schema_info.description}")
+
+                        # Save initial schema (status: processing)
+                        self.schemas[schema_info.table_name] = {
+                            "schema": schema_info.table_schema,
+                            "description": schema_info.description,
+                            "pdf_uuid": pdf_uuid,
+                            "created_at": pd.Timestamp.now().isoformat(),
+                            "status": "processing"
+                        }
+                        self._save_schemas()
+                        print(f"✓ Saved initial schema for {schema_info.table_name}")
+
+                        # Create/track current table
+                        current_table_info = TableInfo(
+                            name=schema_info.table_name,
+                            schema=schema_info.table_schema,
+                            description=schema_info.description,
+                            data=cleaned_table,
+                            column_count=len(cleaned_table[0])
+                        )
+                        current_table_info.context = context_dict
+
+                # Finalize the last table
+                if current_table_info:
+                    print(f"Finalizing last table: {current_table_info.name}")
+                    success = self._store_table_with_schema(current_table_info)
+                    if success:
+                        updated_schema = self.schemas.get(current_table_info.name, {})
+                        stored_tables.append({
+                            "name": current_table_info.name,
+                            "rows": len(current_table_info.data) - 1,
+                            "description": updated_schema.get('description', current_table_info.description)
+                        })
+
+            print(f"\n=== Optimized Processing Complete ===")
+            print(f"Text chunks extracted: {len(text_chunks)}")
+            print(f"Tables stored: {len(stored_tables)}")
+            for table in stored_tables:
+                print(f"  - {table['name']}: {table['rows']}")
+            print("===============================\n")
+
+            return {
+                "text_chunks": text_chunks,
+                "tables_info": stored_tables,
+                "schemas_saved": len(stored_tables),
+                "pdf_name": Path(pdf_path).stem,
+                "pdf_uuid": pdf_uuid
+            }
+
+        except Exception as e:
+            logger.error(f"Optimized PDF extraction failed: {str(e)}")
+            print(f"Error: Optimized PDF extraction failed: {str(e)}")
+            raise ValueError(f"Optimized PDF extraction error: {str(e)}")
 
     def _store_table_with_schema(self, table_info: TableInfo) -> bool:
         """Store table using Gemini-generated schema and Pydantic validation with enhanced numeric parsing."""
@@ -989,7 +1327,7 @@ Respond with valid JSON only:
     # Backward compatibility methods
     def extract_content(self, pdf_path: str) -> Dict[str, Any]:
         """Legacy method for backward compatibility."""
-        result = self.extract_and_store_content(pdf_path)
+        result = self.optimized_extract_and_store(pdf_path)
         # Convert to legacy format
         return {
             "text_chunks": result["text_chunks"],
@@ -999,7 +1337,7 @@ Respond with valid JSON only:
 
     def store_table(self, table_data: List[List[str]], table_name: str) -> bool:
         """Legacy method for backward compatibility."""
-        logger.warning("Using legacy store_table method. Consider using extract_and_store_content instead.")
+        logger.warning("Using legacy store_table method. Consider using optimized_extract_and_store instead.")
         
         if not table_data:
             return False
